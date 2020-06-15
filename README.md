@@ -43,3 +43,4 @@ The project consists of the following modules:
 * [Installing a SORMAS server](SERVER_SETUP.md)
 * [Updating a SORMAS server](SERVER_UPDATE.md)
 * [Customizing a SORMAS server](SERVER_CUSTOMIZATION.md)
+* [Development Server Quickstart](DEVSERVER_QUICKSTART.md)
