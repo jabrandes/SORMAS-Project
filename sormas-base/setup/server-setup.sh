@@ -19,6 +19,56 @@
 
 #!/bin/bash
 
+tokenize_vardef () {
+	local SPLIT_IDX=`expr index "$1" =`
+	local NAME="${1:0:`expr $SPLIT_IDX - 1`}"
+	local VALUE="${1:$SPLIT_IDX}"
+
+	echo "$NAME" "$VALUE"
+}
+
+defaulted () {
+	local VARDEF_PARTS=(`tokenize_vardef "$1"`)
+	local NAME="${VARDEF_PARTS[0]}"
+	local DEFAULT_VALUE="${VARDEF_PARTS[1]}"
+
+	if [[ -z "${!NAME}" ]]; then
+		printf -v "$NAME" '%s' "$DEFAULT_VALUE"
+	fi
+}
+
+prompted_defaulted () {
+	local VARDEF_PARTS=(`tokenize_vardef "$1"`)
+
+	if [[ -z "${!VARDEF_PARTS[0]}" ]]; then
+		local PROMPT
+		if [[ $# -ge 2 ]]; then
+			PROMPT="$2"
+		else
+			PROMPT="Value for variable ${VARDEF_PARTS[0]}"
+		fi
+		PROMPT="${PROMPT}: [${VARDEF_PARTS[1]}] "
+		local VALUE
+		read -p "$PROMPT" VALUE
+		if [[ -z "$VALUE" ]]; then
+			VALUE="${VARDEF_PARTS[1]}"
+		fi
+
+		printf -v "${VARDEF_PARTS[0]}" '%s' "$VALUE"
+	fi
+}
+
+redefine_vars () {
+	local SED_ARG=""
+	for VARDEF in "$@"; do
+		local VARDEF_PARTS=(`tokenize_vardef "$VARDEF"`)
+		SED_ARG="$SED_ARG;"{/^${VARDEF_PARTS[0]}=/c'\'$'\n'"$VARDEF"$'\n'}
+	done
+	SED_ARG="${SED_ARG:1}"
+
+	sed -e "$SED_ARG"
+}
+
 rm -f setup.log
 exec > >(tee -ia setup.log)
 exec 2> >(tee -ia setup.log)
@@ -36,17 +86,13 @@ select LS in "Local" "Server"; do
     esac
 done
 
-if [[ ${DEV_SYSTEM} != true ]]; then
-	echo "--- Is the server meant to be a demo/test or a production server?"
-	select LS in "Demo/Test" "Production"; do
-		case $LS in
-			Demo/Test ) DEMO_SYSTEM=true; break;;
-			Production ) DEMO_SYSTEM=false; break;;
-		esac
-	done
-else
-	DEMO_SYSTEM=false
-fi
+echo "--- Is the server meant to be a demo/test or a production server?"
+select LS in "Demo/Test" "Production"; do
+	case $LS in
+		Demo/Test ) DEMO_SYSTEM=true; break;;
+		Production ) DEMO_SYSTEM=false; break;;
+	esac
+done
 
 # The Java JDK for the payara server (note that spaces in the path are not supported by payara at the moment)
 #AS_JAVA_NATIVE='C:\zulu-8'
@@ -63,27 +109,36 @@ fi
 # DIRECTORIES
 if [[ ${LINUX} = true ]]; then
 	ROOT_PREFIX=
-	# make sure to update payara-sormas script when changing the user name
-	USER_NAME=payara
-	DOWNLOAD_DIR=${ROOT_PREFIX}/var/www/sormas/downloads
-else 
+else
 	ROOT_PREFIX=/c
 fi
 
-TEMP_DIR=${ROOT_PREFIX}/opt/sormas/temp
-GENERATED_DIR=${ROOT_PREFIX}/opt/sormas/generated
-CUSTOM_DIR=${ROOT_PREFIX}/opt/sormas/custom
-PAYARA_HOME=${ROOT_PREFIX}/opt/payara5
-DOMAINS_HOME=${ROOT_PREFIX}/opt/domains
+prompted_defaulted INSTALL_PREFIX=${ROOT_PREFIX}/opt \
+	"Choose your installation base directory"
+INSTALL_PREFIX="`realpath "$INSTALL_PREFIX"`"
+
+SORMAS_DIR="${INSTALL_PREFIX}/sormas"
+DEPLOY_DIR="${SORMAS_DIR}/deploy"
+TEMP_DIR="${SORMAS_DIR}/temp"
+GENERATED_DIR="${SORMAS_DIR}/generated"
+CUSTOM_DIR="${SORMAS_DIR}/custom"
+PAYARA_HOME="${INSTALL_PREFIX}/payara5"
+DOMAINS_HOME="${INSTALL_PREFIX}/domains"
+
+if [[ ${LINUX} = true ]]; then
+	prompted_defaulted USER_NAME=payara "Linux user for payara"
+
+	defaulted DOWNLOAD_DIR="${INSTALL_PREFIX}/sormas/downloads"
+fi
 
 DOMAIN_NAME=sormas
 PORT_BASE=6000
-PORT_ADMIN=6048
+PORT_ADMIN=`expr ${PORT_BASE} + 48`
 DOMAIN_DIR=${DOMAINS_HOME}/${DOMAIN_NAME}
 
 # DB
-DB_HOST=localhost
-DB_PORT=5432
+defaulted DB_HOST=localhost
+defaulted DB_PORT=5432
 DB_NAME=sormas_db
 DB_NAME_AUDIT=sormas_audit_db
 # Name of the database user; DO NOT CHANGE THIS!
@@ -131,7 +186,7 @@ mkdir -p "${CUSTOM_DIR}"
 if [[ ${LINUX} = true ]]; then
 	mkdir -p "${DOWNLOAD_DIR}"
 
-	adduser ${USER_NAME}
+	adduser ${USER_NAME} --no-create-home --disabled-password
 	setfacl -m u:${USER_NAME}:rwx "${DOMAINS_HOME}"
 	setfacl -m u:${USER_NAME}:rwx "${TEMP_DIR}"
 	setfacl -m u:${USER_NAME}:rwx "${GENERATED_DIR}"
@@ -260,8 +315,38 @@ ALTER TABLE IF EXISTS schema_version OWNER TO $DB_USER;
 EOF
 
 if [[ ${LINUX} = true ]]; then
+	defaulted PGSQL_USER=postgres
+	defaulted PGSQL_SOCK=
+
+	EXEC_CMD=()
+	PGSQL_ARGS=(-p ${DB_PORT})
+	if [[ "$DB_HOST" = localhost || "$DB_HOST" = 127.0.0.1 ]]; then
+		if [[ ! -z "$PGSQL_SOCK" ]]; then
+			EXEC_CMD=(su "$PGSQL_USER" -c)
+			PGSQL_ARGS=("${PGSQL_ARGS[@]}" --host "'${PGSQL_SOCK}'")
+		else
+			echo "Connect to database using Unix Domain Socket?"
+			select DECISION in "yes" "no"; do
+			    case $DECISION in
+			        yes ) DB_CONNECT_UNIX=true; break;;
+			        no ) DB_CONNECT_UNIX=false; break;;
+			    esac
+			done
+			if [[ ${DB_CONNECT_UNIX} = true ]]; then
+				EXEC_CMD=(su "$PGSQL_USER" -c)
+			else
+				EXEC_CMD=(bash -c)
+				PGSQL_ARGS=("${PGSQL_ARGS[@]}" --host "'${DB_HOST}'" --username ${PGSQL_USER})
+			fi
+		fi
+	else
+		EXEC_CMD=(bash -c)
+		PGSQL_ARGS=("${PGSQL_ARGS[@]}" --host "'${DB_HOST}'" --username ${PGSQL_USER})
+	fi
+
 	# no host is specified as by default the postgres user has only local access
-	su postgres -c "psql -p ${DB_PORT} < setup.sql"
+	echo "${EXEC_CMD[@]}" "psql ${PGSQL_ARGS[*]} < setup.sql"
+	"${EXEC_CMD[@]}" "psql ${PGSQL_ARGS[*]} < setup.sql"
 else
 	PSQL_DEFAULT="${PROGRAMFILES//\\/\/}/PostgreSQL/10/"
 	echo "--- Enter the name install path of Postgres on your system (default: \"${PSQL_DEFAULT}\":"
@@ -283,14 +368,15 @@ read -p "Database setup completed. Please check the output for any error. Press 
 
 # Setting ASADMIN_CALL and creating domain
 echo "Creating domain for Payara..."
-"${PAYARA_HOME}/bin/asadmin" create-domain --domaindir "${DOMAINS_HOME}" --portbase "${PORT_BASE}" --nopassword "${DOMAIN_NAME}"
-ASADMIN="${PAYARA_HOME}/bin/asadmin --port ${PORT_ADMIN}"
+ASADMIN_CMD="${PAYARA_HOME}/bin/asadmin"
+ASADMIN=("${ASADMIN_CMD}" --port ${PORT_ADMIN})
+"${ASADMIN_CMD}" create-domain --domaindir "${DOMAINS_HOME}" --portbase "${PORT_BASE}" --nopassword "${DOMAIN_NAME}"
 
 if [[ ${LINUX} = true ]]; then
 	chown -R "${USER_NAME}:${USER_NAME}" "${PAYARA_HOME}"
 fi
 
-${PAYARA_HOME}/bin/asadmin start-domain --domaindir ${DOMAINS_HOME} ${DOMAIN_NAME}
+"${ASADMIN[@]}" start-domain --domaindir ${DOMAINS_HOME} ${DOMAIN_NAME}
 
 if [[ 0 != $? ]]; then
 	echo "ERROR: Payara domain failed to start."
@@ -305,25 +391,46 @@ done
 echo "Configuring domain..."
 
 # General domain settings
-${ASADMIN} delete-jvm-options -Xmx512m
-${ASADMIN} create-jvm-options -Xmx4096m
+"${ASADMIN[@]}" delete-jvm-options -Xmx512m
+"${ASADMIN[@]}" create-jvm-options -Xmx4096m
 
 # JDBC pool
-${ASADMIN} create-jdbc-connection-pool --restype javax.sql.ConnectionPoolDataSource --datasourceclassname org.postgresql.ds.PGConnectionPoolDataSource --isconnectvalidatereq true --validationmethod custom-validation --validationclassname org.glassfish.api.jdbc.validation.PostgresConnectionValidation --property "portNumber=${DB_PORT}:databaseName=${DB_NAME}:serverName=${DB_HOST}:user=${DB_USER}:password=${DB_PW}" ${DOMAIN_NAME}DataPool
-${ASADMIN} create-jdbc-resource --connectionpoolid ${DOMAIN_NAME}DataPool jdbc/${DOMAIN_NAME}DataPool
+"${ASADMIN[@]}" create-jdbc-connection-pool --restype javax.sql.ConnectionPoolDataSource --datasourceclassname org.postgresql.ds.PGConnectionPoolDataSource --isconnectvalidatereq true --validationmethod custom-validation --validationclassname org.glassfish.api.jdbc.validation.PostgresConnectionValidation --property "portNumber=${DB_PORT}:databaseName=${DB_NAME}:serverName=${DB_HOST}:user=${DB_USER}:password=${DB_PW}" ${DOMAIN_NAME}DataPool
+"${ASADMIN[@]}" create-jdbc-resource --connectionpoolid ${DOMAIN_NAME}DataPool jdbc/${DOMAIN_NAME}DataPool
 
 # Pool for audit log
-${ASADMIN} create-jdbc-connection-pool --restype javax.sql.XADataSource --datasourceclassname org.postgresql.xa.PGXADataSource --isconnectvalidatereq true --validationmethod custom-validation --validationclassname org.glassfish.api.jdbc.validation.PostgresConnectionValidation --property "portNumber=${DB_PORT}:databaseName=${DB_NAME_AUDIT}:serverName=${DB_HOST}:user=${DB_USER}:password=${DB_PW}" ${DOMAIN_NAME}AuditlogPool
-${ASADMIN} create-jdbc-resource --connectionpoolid ${DOMAIN_NAME}AuditlogPool jdbc/AuditlogPool
+"${ASADMIN[@]}" create-jdbc-connection-pool --restype javax.sql.XADataSource --datasourceclassname org.postgresql.xa.PGXADataSource --isconnectvalidatereq true --validationmethod custom-validation --validationclassname org.glassfish.api.jdbc.validation.PostgresConnectionValidation --property "portNumber=${DB_PORT}:databaseName=${DB_NAME_AUDIT}:serverName=${DB_HOST}:user=${DB_USER}:password=${DB_PW}" ${DOMAIN_NAME}AuditlogPool
+"${ASADMIN[@]}" create-jdbc-resource --connectionpoolid ${DOMAIN_NAME}AuditlogPool jdbc/AuditlogPool
 
-${ASADMIN} create-javamail-resource --mailhost localhost --mailuser user --fromaddress "${MAIL_FROM}" mail/MailSession
+"${ASADMIN[@]}" create-javamail-resource --mailhost localhost --mailuser user --fromaddress "${MAIL_FROM}" mail/MailSession
 
-${ASADMIN} create-custom-resource --restype java.util.Properties --factoryclass org.glassfish.resources.custom.factory.PropertiesFactory --property "org.glassfish.resources.custom.factory.PropertiesFactory.fileName=\${com.sun.aas.instanceRoot}/sormas.properties" sormas/Properties
+"${ASADMIN[@]}" create-custom-resource --restype java.util.Properties --factoryclass org.glassfish.resources.custom.factory.PropertiesFactory --property "org.glassfish.resources.custom.factory.PropertiesFactory.fileName=\${com.sun.aas.instanceRoot}/sormas.properties" sormas/Properties
 
-cp sormas.properties "${DOMAIN_DIR}"
-cp start-payara-sormas.sh "${DOMAIN_DIR}"
-cp stop-payara-sormas.sh "${DOMAIN_DIR}"
-cp logback.xml ${DOMAIN_DIR}/config/
+redefine_vars \
+	temp.path="$TEMP_DIR" \
+	generated.path="$GENERATED_DIR" \
+	custom.path="$CUSTOM_DIR" \
+	email.sender.address="$MAIL_FROM" \
+	devmode=`test $DEV_SYSTEM = true && echo true || echo false` \
+	< sormas.defaults.properties \
+	> "$DOMAIN_DIR/sormas.properties"
+redefine_vars \
+	ASADMIN="\"$ASADMIN_CMD\"" \
+	ASADMIN_PORT="\"$PORT_ADMIN\"" \
+	DOMAIN_DIR="\"$DOMAINS_HOME\"" \
+	DOMAIN_NAME="\"$DOMAIN_NAME\"" \
+	< start-payara-sormas.sh \
+	> "${DOMAIN_DIR}/start-payara-sormas.sh"
+redefine_vars \
+	ASADMIN="\"$ASADMIN_CMD\"" \
+	ASADMIN_PORT="\"$PORT_ADMIN\"" \
+	DOMAIN_DIR="\"$DOMAINS_HOME\"" \
+	DOMAIN_NAME="\"$DOMAIN_NAME\"" \
+	< stop-payara-sormas.sh \
+	> "${DOMAIN_DIR}/stop-payara-sormas.sh"
+chmod 755 "${DOMAIN_DIR}"/*-payara-sormas.sh
+
+cp logback.xml "${DOMAIN_DIR}/config/"
 if [[ ${DEV_SYSTEM} = true ]] && [[ ${LINUX} != true ]]; then
 	# Fixes outdated certificate - don't do this on linux systems!
 	cp cacerts.jks.bin "${DOMAIN_DIR}/config/cacerts.jks"
@@ -336,12 +443,33 @@ else
 	cp loginmain.html "${CUSTOM_DIR}"
 fi
 
-
+INSTALL_AS_SERVICE=false
 if [[ ${LINUX} = true ]]; then
-	cp payara-sormas.sh /etc/init.d/payara-sormas
+	if [[ ${DEV_SYSTEM} = true ]]; then
+		echo "Do you want to install SORMAS as a service?"
+		select DECISION in "yes" "no"; do
+		    case $DECISION in
+		        yes ) INSTALL_AS_SERVICE=true; break;;
+		        no ) INSTALL_AS_SERVICE=false; break;;
+		    esac
+		done
+	else
+		INSTALL_AS_SERVICE=true
+	fi
+fi
+
+if [[ $INSTALL_AS_SERVICE = true ]]; then
+	redefine_vars \
+		ASADMIN="\"$ASADMIN_CMD\"" \
+		ASADMIN_PORT="\"$PORT_ADMIN\"" \
+		LOGIN_USER="\"$USER_NAME\"" \
+		DOMAIN_DIR="\"$DOMAINS_HOME\"" \
+		DOMAIN_NAME="\"$DOMAIN_NAME\"" \
+		< payara-sormas.sh
+		> /etc/init.d/payara-sormas
 	chmod 755 /etc/init.d/payara-sormas
 	update-rc.d payara-sormas defaults
-	
+
 	chown -R ${USER_NAME}:${USER_NAME} "${DOMAIN_DIR}"
 fi
 
@@ -349,38 +477,58 @@ read -p "--- Press [Enter] to continue..."
 
 # Logging
 echo "Configuring logging..."
-${ASADMIN} create-jvm-options "-Dlogback.configurationFile=\${com.sun.aas.instanceRoot}/config/logback.xml"
-${ASADMIN} set-log-attributes com.sun.enterprise.server.logging.GFFileHandler.maxHistoryFiles=14
-${ASADMIN} set-log-attributes com.sun.enterprise.server.logging.GFFileHandler.rotationLimitInBytes=0
-${ASADMIN} set-log-attributes com.sun.enterprise.server.logging.GFFileHandler.rotationOnDateChange=true
-#${ASADMIN} set-log-levels org.wamblee.glassfish.auth.HexEncoder=SEVERE
-#${ASADMIN} set-log-levels javax.enterprise.system.util=SEVERE
+"${ASADMIN[@]}" create-jvm-options "-Dlogback.configurationFile=\${com.sun.aas.instanceRoot}/config/logback.xml"
+"${ASADMIN[@]}" set-log-attributes com.sun.enterprise.server.logging.GFFileHandler.maxHistoryFiles=14
+"${ASADMIN[@]}" set-log-attributes com.sun.enterprise.server.logging.GFFileHandler.rotationLimitInBytes=0
+"${ASADMIN[@]}" set-log-attributes com.sun.enterprise.server.logging.GFFileHandler.rotationOnDateChange=true
+#"${ASADMIN[@]}" set-log-levels org.wamblee.glassfish.auth.HexEncoder=SEVERE
+#"${ASADMIN[@]}" set-log-levels javax.enterprise.system.util=SEVERE
 
 if [[ ${DEV_SYSTEM} != true ]]; then
 	# Make the payara listen to localhost only
 	echo "Configuring security settings..."
-	${ASADMIN} set configs.config.server-config.http-service.virtual-server.server.network-listeners=http-listener-1
-	${ASADMIN} delete-network-listener --target=server-config http-listener-2
-	${ASADMIN} set configs.config.server-config.network-config.network-listeners.network-listener.admin-listener.address=127.0.0.1
-	${ASADMIN} set configs.config.server-config.network-config.network-listeners.network-listener.http-listener-1.address=127.0.0.1
-	${ASADMIN} set configs.config.server-config.iiop-service.iiop-listener.orb-listener-1.address=127.0.0.1
-	${ASADMIN} set configs.config.server-config.iiop-service.iiop-listener.SSL.address=127.0.0.1
-	${ASADMIN} set configs.config.server-config.iiop-service.iiop-listener.SSL_MUTUALAUTH.address=127.0.0.1
-	${ASADMIN} set configs.config.server-config.jms-service.jms-host.default_JMS_host.host=127.0.0.1
-	${ASADMIN} set configs.config.server-config.admin-service.jmx-connector.system.address=127.0.0.1
-	${ASADMIN} set-hazelcast-configuration --enabled=false
+	"${ASADMIN[@]}" set configs.config.server-config.http-service.virtual-server.server.network-listeners=http-listener-1
+	"${ASADMIN[@]}" delete-network-listener --target=server-config http-listener-2
+	"${ASADMIN[@]}" set configs.config.server-config.network-config.network-listeners.network-listener.admin-listener.address=127.0.0.1
+	"${ASADMIN[@]}" set configs.config.server-config.network-config.network-listeners.network-listener.http-listener-1.address=127.0.0.1
+	"${ASADMIN[@]}" set configs.config.server-config.iiop-service.iiop-listener.orb-listener-1.address=127.0.0.1
+	"${ASADMIN[@]}" set configs.config.server-config.iiop-service.iiop-listener.SSL.address=127.0.0.1
+	"${ASADMIN[@]}" set configs.config.server-config.iiop-service.iiop-listener.SSL_MUTUALAUTH.address=127.0.0.1
+	"${ASADMIN[@]}" set configs.config.server-config.jms-service.jms-host.default_JMS_host.host=127.0.0.1
+	"${ASADMIN[@]}" set configs.config.server-config.admin-service.jmx-connector.system.address=127.0.0.1
+	"${ASADMIN[@]}" set-hazelcast-configuration --enabled=false
 fi
 
 # don't stop the domain, because we need it running for the update script
 #read -p "--- Press [Enter] to continue..."
-#"${PAYARA_HOME}/bin/asadmin" stop-domain --domaindir "${DOMAINS_HOME}" "${DOMAIN_NAME}"
+#"${ASADMIN[@]}" stop-domain --domaindir "${DOMAINS_HOME}" "${DOMAIN_NAME}"
+
+# Automatically adjust server-update.conf to reflect the system as currently
+# set up by this script
+redefine_vars \
+	DEPLOY_PATH="." \
+	GLASSFISH_PATH="\"${PAYARA_HOME}/glassfish\"" \
+	DOMAIN_PATH="\"$DOMAINS_HOME\"" \
+	DOMAIN_NAME="\"$DOMAIN_NAME\"" \
+	DOWNLOADS_PATH="\"$DOWNLOAD_DIR\"" \
+	DB_BACKUP_PATH="\"${SORMAS_DIR}/backup\"" \
+	DATABASE_NAME="\"$DB_NAME\"" \
+	DATABASE_AUDIT_NAME="\"$DB_NAME_AUDIT\"" \
+	CUSTOM_DIR="\"$CUSTOM_DIR\"" \
+	USER_NAME="\"$USER_NAME\"" \
+	< server-update.defaults.conf \
+	> server-update.conf
+
+echo "Copying current files to deployment directory"
+mkdir -p "${DEPLOY_DIR}/$(date +%F)"
+cp -r ./* "${DEPLOY_DIR}/$(date +%F)"
 
 echo "Server setup completed."
 echo "Commands to start and stop the domain: "
-if [[ ${LINUX} = true ]]; then
+if [[ ${INSTALL_AS_SERVICE} = true ]]; then
 	echo "service payara-sormas start"
 	echo "service payara-sormas stop"
-else 
+else
 	echo "${DOMAIN_DIR}/start-payara-sormas.sh"
 	echo "${DOMAIN_DIR}/stop-payara-sormas.sh"
 fi
@@ -388,7 +536,7 @@ echo "---"
 echo "Please make sure to perform the following steps:"
 echo "  - Adjust the sormas.properties file to your system"
 if [[ ${DEV_SYSTEM} != true ]]; then
-	echo "  - Execute the sormas-update.sh file to populate the database and deploy the server"
+	echo "  - Execute the server-update.sh file to populate the database and deploy the server"
 	echo "  - Configure the apache web server according to the server setup guide"
 fi
 	echo "  - Execute the r-setup.sh file to enable disease network diagrams"

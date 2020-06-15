@@ -10,16 +10,20 @@
 
 
 ASADMIN="/opt/payara5/bin/asadmin"
+ASADMIN_PORT=6048
+LOGIN_USER="payara"
+DOMAIN_DIR="/opt/domains"
+DOMAIN_NAME="sormas"
 
 case "$1" in
 start)
-    su --login payara --command "$ASADMIN start-domain --domaindir /opt/domains sormas"
+    su --login "$LOGIN_USER" --command "$ASADMIN --port $ASADMIN_PORT start-domain --domaindir \"$DOMAIN_DIR\" \"$DOMAIN_NAME\""
     ;;
 stop)
-    su --login payara --command "$ASADMIN stop-domain --domaindir /opt/domains sormas"
+    su --login "$LOGIN_USER" --command "$ASADMIN --port $ASADMIN_PORT stop-domain --domaindir \"$DOMAIN_DIR\" \"$DOMAIN_NAME\""
     ;;
 restart)
-    su --login payara --command "$ASADMIN restart-domain --domaindir /opt/domains sormas"
+    su --login "$LOGIN_USER" --command "$ASADMIN --port $ASADMIN_PORT restart-domain --domaindir \"$DOMAIN_DIR\" \"$DOMAIN_NAME\""
     ;;
 *)
     echo "usage: $0 (start|stop|restart|help)"

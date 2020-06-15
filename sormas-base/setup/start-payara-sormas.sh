@@ -20,4 +20,8 @@
 
 DIR=$(dirname "$0")
 ASADMIN="${DIR}/../../payara5/bin/asadmin"
-${ASADMIN} start-domain --domaindir "${DIR}/../"  sormas
+ASADMIN_PORT=6048
+DOMAIN_DIR="${DIR}/../"
+DOMAIN_NAME="sormas"
+
+"${ASADMIN}" --port $ASADMIN_PORT start-domain --domaindir "$DOMAIN_DIR"  "$DOMAIN_NAME"
